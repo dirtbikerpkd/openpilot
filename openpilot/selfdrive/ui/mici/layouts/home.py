@@ -203,7 +203,7 @@ class MiciHomeLayout(Widget):
     version = ui_state.params.get("Version")
     git_branch = ui_state.params.get("GitBranch")
     git_commit = ui_state.params.get("GitCommit")
-    commit = "professionally unqualified since 2026"
+    commit = "professionally unqualified since 1982"
 
     if not all((version, git_branch, git_commit, commit)):
       return None
