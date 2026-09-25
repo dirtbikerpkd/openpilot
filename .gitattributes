@@ -15,3 +15,4 @@ openpilot/common/hardware/comma/updater filter=lfs diff=lfs merge=lfs -text
 
 # personal fork: custom spinner logo stored as a plain blob (NOT LFS) so installs never need an LFS object for it
 openpilot/sunnypilot/selfdrive/assets/images/spinner_pa.png -filter -diff -merge -text
+openpilot/sunnypilot/selfdrive/assets/images/screensaver_pa.png -filter -diff -merge -text

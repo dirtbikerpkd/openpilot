@@ -11,9 +11,13 @@ import pyray as rl
 
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.params import Params
-from openpilot.system.ui.lib.application import gui_app, FontWeight
-from openpilot.system.ui.lib.text_measure import measure_text_cached
+from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
+
+# personal fork: the bouncing element is the custom P@ logo (was the "sunnypilot" text). 3:2 artwork, edges pre-faded to
+# transparent so it reads as free-floating on the black screen.
+LOGO_PATH = "../../sunnypilot/selfdrive/assets/images/screensaver_pa.png"
+LOGO_ASPECT = 480 / 720  # height / width of the artwork
 
 
 class ScreenSaverSP(Widget):
@@ -27,15 +31,12 @@ class ScreenSaverSP(Widget):
     self.y = 100.0
     self.vx = 120.0 if self._is_mici else 300.0
     self.vy = 70.0 if self._is_mici else 200.0
-    self._hue = 150
-    self.color = rl.color_from_hsv(self._hue, 1, 1)
 
-    self.text = "sunnypilot"
-    self.font_size = 50 if self._is_mici else 200
+    self.logo_width = 210 if self._is_mici else 525
+    self.logo_height = round(self.logo_width * LOGO_ASPECT)
     self._start_time = None
     self._dismiss = False
     self._screensaver_timeout = 300
-    self._hit_last_frame = False
 
   @property
   def is_active(self) -> bool:
@@ -65,11 +66,6 @@ class ScreenSaverSP(Widget):
   def _update_state(self):
     super()._update_state()
 
-    self.font = gui_app.font(FontWeight.AUDIOWIDE)
-    text_size = measure_text_cached(self.font, self.text, self.font_size, 0)
-    self.logo_width = text_size.x
-    self.logo_height = text_size.y
-
     if self._start_time and time.monotonic() - self._start_time > self._screensaver_timeout:
       self._dismiss = True
       self._start_time = None
@@ -79,40 +75,23 @@ class ScreenSaverSP(Widget):
     self.x += self.vx * dt
     self.y += self.vy * dt
 
-    hit_x = hit_y = False
     if self.x + self.logo_width > self.rect.width:
       self.vx *= -1
       self.x = self.rect.width - self.logo_width
-      hit_x = True
     elif self.x < 0:
       self.vx *= -1
       self.x = 0
-      hit_x = True
 
     if self.y + self.logo_height > self.rect.height:
       self.vy *= -1
       self.y = self.rect.height - self.logo_height
-      hit_y = True
     elif self.y < 0:
       self.vy *= -1
       self.y = 0
-      hit_y = True
-
-    hit = hit_x or hit_y
-    if hit and not self._hit_last_frame:
-      while self._hue_dist((new_hue := rl.get_random_value(0, 360)), self._hue) < 120:
-        pass
-      self._hue = new_hue
-      self.color = rl.color_from_hsv(self._hue, 1, 1)
-    self._hit_last_frame = hit
-
-  @staticmethod
-  def _hue_dist(a, b):
-    d = abs(a - b)
-    return min(d, 360 - d)
 
   def _render(self, rect: rl.Rectangle):
     self.set_rect(rect)
     rl.clear_background(rl.BLACK)
-    rl.draw_text_ex(self.font, self.text, rl.Vector2(int(self.x), int(self.y)), self.font_size, 0, self.color)
+    logo = gui_app.texture(LOGO_PATH, self.logo_width, self.logo_height)  # cached after the first call
+    rl.draw_texture_v(logo, rl.Vector2(int(self.x), int(self.y)), rl.WHITE)
     return -1
