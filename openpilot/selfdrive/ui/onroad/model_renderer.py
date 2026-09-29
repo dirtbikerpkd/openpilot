@@ -115,7 +115,12 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     model = sm['modelV2']
     radar_state = sm['radarState'] if sm.valid['radarState'] else None
     lead_one = radar_state.leadOne if radar_state else None
-    render_lead_indicator = self._longitudinal_control and radar_state is not None
+    # RDX personal-fork change: don't gate the lead indicator/chevron metrics on
+    # openpilotLongitudinalControl. This car intentionally runs alpha long off (stock ACC
+    # drives, Bosch-A radar left alive instead - see rdx-eps-tuning-project.md §2r/§2w) but
+    # still has real radarState.leadOne data to show; upstream's assumption that "not
+    # controlling longitudinal" means "nothing useful to display" doesn't hold here.
+    render_lead_indicator = radar_state is not None
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
