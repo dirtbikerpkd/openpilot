@@ -160,6 +160,7 @@ class ModelRenderer(Widget, ModelRendererSP):
 
     if render_lead_indicator and radar_state:
       self._draw_lead_indicator()
+      self.chevron_metrics.draw_lead_status(sm, radar_state, self._rect, self._lead_vehicles)
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""

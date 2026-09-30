@@ -22,9 +22,13 @@ class ChevronOptions:
 
 
 class ChevronMetrics:
-  def __init__(self):
+  def __init__(self, font_size: int = 40, line_height: int = 50, margin: int = 20, chevron_scale: float = 2.35):
     self._lead_status_alpha: float = 0.0
     self._font = gui_app.font(FontWeight.SEMI_BOLD)
+    self._font_size = font_size
+    self._line_height = line_height
+    self._margin = margin
+    self._chevron_scale = chevron_scale
 
   def update_alpha(self, has_lead: bool):
     """Update the alpha value for fade in/out animation"""
@@ -50,7 +54,7 @@ class ChevronMetrics:
 
     chevron_x = lead_vehicle.chevron[1][0]
     chevron_y = lead_vehicle.chevron[1][1]
-    sz = np.clip((25 * 30) / (d_rel / 3 + 30), 15.0, 30.0) * 2.35
+    sz = np.clip((25 * 30) / (d_rel / 3 + 30), 15.0, 30.0) * self._chevron_scale
 
     text_lines = self._build_text_lines(d_rel, v_rel, v_ego)
     if not text_lines:
@@ -89,9 +93,9 @@ class ChevronMetrics:
   def _render_text_lines(self, text_lines: list[str], chevron_x: float, chevron_y: float,
                          sz: float, rect: rl.Rectangle):
     """Render text lines with proper centering and positioning"""
-    font_size = 40
-    line_height = 50
-    margin = 20
+    font_size = self._font_size
+    line_height = self._line_height
+    margin = self._margin
 
     text_y = chevron_y + sz + 15
     total_height = len(text_lines) * line_height
