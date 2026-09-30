@@ -132,7 +132,11 @@ class ModelRenderer(Widget, ModelRendererSP):
     model = sm['modelV2']
     radar_state = sm['radarState'] if sm.valid['radarState'] else None
     lead_one = radar_state.leadOne if radar_state else None
-    render_lead_indicator = self._longitudinal_control and radar_state is not None
+    # RDX personal-fork change (mirrors openpilot/selfdrive/ui/onroad/model_renderer.py,
+    # commit 17379907a): don't gate the lead indicator on openpilotLongitudinalControl.
+    # This car runs alpha long off (stock ACC drives, Bosch-A radar left alive - see
+    # rdx-eps-tuning-project.md §2r/§2w/§2z) but still has real radarState.leadOne data.
+    render_lead_indicator = radar_state is not None
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
@@ -154,8 +158,8 @@ class ModelRenderer(Widget, ModelRendererSP):
       self._draw_lane_lines()
       self._draw_path(sm)
 
-    # if render_lead_indicator and radar_state:
-    #   self._draw_lead_indicator()
+    if render_lead_indicator and radar_state:
+      self._draw_lead_indicator()
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""
