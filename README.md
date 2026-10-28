@@ -9,6 +9,9 @@ This is a personal fork of [sunnypilot](https://github.com/sunnyhaibin/sunnypilo
 * RDX 3G `LOW_SPEED_LOCKOUT` reported by the EPS above minimum steer speed is raised as `steerFaultTemporary`, so a silent loss of EPS assist alerts instead of being ignored.
 * Honda-specific CAN validity logging, plus extra Honda fingerprints (2026 Civic Hatchback ICE, 2027 HR-V).
 * Boot path synced from `rdx-tuning-202609-sp`: AGNOS 19.7 manifest and launcher fixes.
+* Bosch-A radar decoder (reads the stock radar's object list, RX only; on by default via the `HondaBoschARadar` param) with a `radard` lateral-match gate. It only decodes while openpilot longitudinal is off, because enabling openpilot long silences the radar ECU.
+* Lead vehicle distance / speed / time-to-collision shown next to the lead chevron on the comma four screen, even without openpilot longitudinal control.
+* Custom P@ logo for the loading spinner and the bouncing screensaver. The power-on comma logo comes from AGNOS firmware and is not changed by this repo.
 
 **Install (comma four)**
 1. On the device, choose *Custom Software* at setup, or Settings → Software → *Uninstall* and reinstall.
@@ -21,7 +24,7 @@ This is a personal fork of [sunnypilot](https://github.com/sunnyhaibin/sunnypilo
 
 **Branches**
 * `rdx-torque-tuning` is the default branch and the one to install.
-* `rdx-tuning-202609-sp` is an older, separate line based on a newer sunnypilot snapshot.
+* `rdx-tuning-202609-sp` is a separate line based on a newer sunnypilot snapshot. It also carries the Honda steering torque learner and Nidec work, which are not in `rdx-torque-tuning`.
 
 **Notes**
 * The RDX 3G runs a PID lateral tune. `EnforceTorqueControl` and `NeuralNetworkLateralControl` are sunnypilot settings you can try, but they are not enabled by this fork.
