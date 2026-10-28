@@ -1,5 +1,33 @@
 ![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
 
+## 🔧 About this fork (dirtbikerpkd / `rdx-torque-tuning`)
+This is a personal fork of [sunnypilot](https://github.com/sunnyhaibin/sunnypilot) (itself a fork of comma.ai's openpilot), tuned for an **Acura RDX 3G** (`ACURA_RDX_3G`) on a **comma four**. It is not an official sunnypilot or comma release; use it at your own risk and see the license notes below.
+
+**What's different from upstream sunnypilot**
+* `opendbc_repo` points at [dirtbikerpkd/opendbc-rdx-tuning](https://github.com/dirtbikerpkd/opendbc-rdx-tuning) (branch `rdx-torque-tuning`) instead of the stock opendbc.
+* RDX 3G steering tune: doubled `STEER_DELTA_UP/DOWN` ramp rate, `STEER_THRESHOLD` raised to 1500, and `steerActuatorDelay` of 0.15s.
+* RDX 3G `LOW_SPEED_LOCKOUT` reported by the EPS above minimum steer speed is raised as `steerFaultTemporary`, so a silent loss of EPS assist alerts instead of being ignored.
+* Honda-specific CAN validity logging, plus extra Honda fingerprints (2026 Civic Hatchback ICE, 2027 HR-V).
+* Boot path synced from `rdx-tuning-202609-sp`: AGNOS 19.7 manifest and launcher fixes.
+
+**Install (comma four)**
+1. On the device, choose *Custom Software* at setup, or Settings → Software → *Uninstall* and reinstall.
+2. When prompted for the software URL, enter just the user/branch:
+   ```
+   dirtbikerpkd/rdx-torque-tuning
+   ```
+3. The device downloads the branch and reboots. This branch ships **without a prebuilt**, so the first boot compiles on the device (scons) and shows a progress spinner. It can take a long time; don't power-cycle it.
+4. If the device gets stuck on the comma logo, SSH in and check `cat /VERSION` and `tail -50 /tmp/launch_log`. The branch expects AGNOS **19.7**.
+
+**Branches**
+* `rdx-torque-tuning` is the default branch and the one to install.
+* `rdx-tuning-202609-sp` is an older, separate line based on a newer sunnypilot snapshot.
+
+**Notes**
+* The RDX 3G runs a PID lateral tune. `EnforceTorqueControl` and `NeuralNetworkLateralControl` are sunnypilot settings you can try, but they are not enabled by this fork.
+
+---
+
 ## 🌞 What is sunnypilot?
 [sunnypilot](https://github.com/sunnyhaibin/sunnypilot) is a fork of comma.ai's openpilot, an open source driver assistance system. sunnypilot offers the user a unique driving experience for over 300+ supported car makes and models with modified behaviors of driving assist engagements. sunnypilot complies with comma.ai's safety rules as accurately as possible.
 
