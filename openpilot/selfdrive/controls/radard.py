@@ -29,6 +29,14 @@ V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
+# RDX personal-fork change (idea from StarPilot's track_matches_vision): a radar track may only be matched to the
+# camera lead if it is also laterally close to it. Stock radard ranks tracks by lateral closeness but never
+# rejects on it, so an oncoming car 6 m off-lane crossing the lead's range was accepted as the lead (false FCW,
+# 2026-09-30). On that drive |track.yRel - camera lead yRel| was median 0.23 m / p95 2.4 m / p99 3.6 m for
+# radar-matched leads; the false match was 6.2-6.5 m.
+LAT_SANE_FLOOR_M = 2.5
+LAT_SANE_YSTD_SCALE = 2.0
+
 
 class KalmanParams:
   def __init__(self, dt: float):
@@ -131,7 +139,8 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
   # stationary radar points can be false positives
   dist_sane = abs(track.dRel - offset_vision_dist) < max([(offset_vision_dist)*.25, 5.0])
   vel_sane = (abs(track.vRel + v_ego - lead.v[0]) < 10) or (v_ego + track.vRel > 3)
-  if dist_sane and vel_sane:
+  lat_sane = abs(track.yRel + lead.y[0]) < max(LAT_SANE_FLOOR_M, LAT_SANE_YSTD_SCALE * lead.yStd[0])
+  if dist_sane and vel_sane and lat_sane:
     return track
   else:
     return None
