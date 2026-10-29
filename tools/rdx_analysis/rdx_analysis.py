@@ -27,7 +27,25 @@ ROOT = Path(__file__).resolve().parents[2]
 REMOTE_REALDATA = "/data/media/0/realdata"
 MPH = 0.44704
 
+# Raw CAN frames the RDX 3G EPS broadcasts. carState does not expose motor torque for Honda, so
+# these are decoded straight from the rlog `can` events (layouts from opendbc _honda_common.dbc /
+# _bosch_2018.dbc: STEER_MOTOR_TORQUE 0x1AB, STEER_STATUS 0x18F). Checksums are not verified.
+ADDR_STEER_MOTOR_TORQUE = 427
+ADDR_STEER_STATUS = 399
+STEER_STATUS_NAMES = {0: "normal", 1: "driver_steering", 2: "no_torque_alert_1", 3: "low_speed_lockout",
+                      4: "no_torque_alert_2", 5: "fault_1", 6: "tmp_fault", 7: "permanent_fault"}
+
 _log = None
+
+
+def decode_motor_torque(dat):
+  """STEER_MOTOR_TORQUE.MOTOR_TORQUE: 10-bit unsigned, big-endian, start bit 1. A magnitude, no sign."""
+  return ((dat[0] & 0x03) << 8) | dat[1] if len(dat) >= 2 else None
+
+
+def decode_steer_status(dat):
+  """STEER_STATUS.STEER_STATUS (4 bits, start bit 39) and STEER_CONTROL_ACTIVE (bit 35), both in byte 4."""
+  return (dat[4] >> 4, (dat[4] >> 3) & 1) if len(dat) >= 5 else None
 
 
 def load_schema():
@@ -106,7 +124,7 @@ def _lead(ld):
 
 def extract(paths):
   """Returns (DataFrame of per-service samples keyed on monotonic seconds, wall-clock offset or None)."""
-  rows = {k: [] for k in ("carState", "carOutput", "carControl", "radarState", "selfdriveState")}
+  rows = {k: [] for k in ("carState", "carOutput", "carControl", "radarState", "selfdriveState", "epsMotor", "steerStatus")}
   offsets = []
   for f in find_logs(paths):
     for ev in read_events(f):
@@ -124,6 +142,18 @@ def extract(paths):
         rows[w].append((t, *_lead(ev.radarState.leadOne)))
       elif w == "selfdriveState":
         rows[w].append((t, ev.selfdriveState.enabled, ev.selfdriveState.active))
+      elif w == "can":
+        for c in ev.can:
+          if c.src >= 128:  # loopback of our own sendcan
+            continue
+          if c.address == ADDR_STEER_MOTOR_TORQUE:
+            m = decode_motor_torque(c.dat)
+            if m is not None:
+              rows["epsMotor"].append((t, m))
+          elif c.address == ADDR_STEER_STATUS:
+            st = decode_steer_status(c.dat)
+            if st is not None:
+              rows["steerStatus"].append((t, *st))
       elif w == "clocks" and ev.clocks.wallTimeNanos:
         offsets.append(ev.clocks.wallTimeNanos * 1e-9 - t)
       elif w == "initData" and ev.initData.wallTimeNanos:
@@ -135,6 +165,8 @@ def extract(paths):
     "carControl": ["t", "latActive"],
     "radarState": ["t", "lead_present", "lead_radar", "lead_dRel", "lead_vLead", "lead_vRel"],
     "selfdriveState": ["t", "sd_enabled", "sd_active"],
+    "epsMotor": ["t", "eps_motor"],
+    "steerStatus": ["t", "steer_status", "steer_ctrl_active"],
   }
   frames = {k: pd.DataFrame(v, columns=cols[k]).sort_values("t") for k, v in rows.items()}
   return frames, (float(np.median(offsets)) if offsets else None)
@@ -216,6 +248,7 @@ def runs(mask, min_len):
 
 
 def estimate_lag(cmd, eps, hz, max_lag_s=0.6):
+  """Lag (s) and correlation of the strongest cmd -> eps match. Pass abs() of both for an unsigned eps."""
   best = (0.0, 0.0)
   for k in range(0, int(max_lag_s * hz) + 1):
     a, b = (cmd[:len(cmd) - k], eps[k:]) if k else (cmd, eps)
@@ -240,85 +273,153 @@ def analyze(df, args, hz):
   v = df.vEgo.fillna(0).to_numpy()
   lat = df.get("latActive", pd.Series(0, index=df.index)).fillna(0).to_numpy() > 0
   cmd_can = (df.cmd_torque.fillna(0) * args.steer_max).to_numpy()
-  eps = df.steeringTorqueEps.fillna(0).to_numpy()
+  # Honda carState never fills steeringTorqueEps, so prefer the motor torque decoded from raw CAN.
+  eps_col = "eps_motor" if "eps_motor" in df and df.eps_motor.fillna(0).abs().max() > 0 else "steeringTorqueEps"
+  eps = df[eps_col].fillna(0).to_numpy()
+  unsigned = eps_col == "eps_motor"  # STEER_MOTOR_TORQUE is a 10-bit magnitude
   active = lat & (v > args.min_speed * MPH)
-  dur = len(df) / hz
+  have_eps = bool(np.abs(eps[active]).max() > 0) if active.any() else False
+  # The grid spans boot gaps between drives (carState rows are NaN there); only count real driving time.
+  valid = df.vEgo.notna().to_numpy()
+  nvalid = max(int(valid.sum()), 1)
+  dur = nvalid / hz
 
   w("# RDX drive report\n")
   w(f"- span: {fmt_time(df.wall.iloc[0] if 'wall' in df else None)} -> {fmt_time(df.wall.iloc[-1] if 'wall' in df else None)}"
     f" ({dur / 60:.1f} min, {hz:g} Hz)")
-  w(f"- lateral active: {active.mean() * 100:.1f}% of the time ({active.sum() / hz / 60:.1f} min above {args.min_speed:g} mph)")
+  w(f"- lateral active: {active.sum() / nvalid * 100:.1f}% of the time ({active.sum() / hz / 60:.1f} min above {args.min_speed:g} mph)")
   if "sd_active" in df:
-    w(f"- openpilot engaged (selfdriveState.active): {df.sd_active.fillna(0).mean() * 100:.1f}%")
+    w(f"- openpilot engaged (selfdriveState.active): {df.sd_active.fillna(0).sum() / nvalid * 100:.1f}%")
   if active.sum() < 50:
     w("\nNot enough lateral-active time to analyze steering. (Drive engaged, then re-extract.)")
     return "\n".join(L), df, None
 
-  # --- authority per speed bin --------------------------------------------------------------
-  w("\n## EPS authority by speed\n")
-  w("Commanded torque is carOutput.actuatorsOutput.torque * steer_max (CAN units). EPS torque is carState.steeringTorqueEps "
-    "(Honda STEER_MOTOR_TORQUE). Only samples where |cmd| > "
-    f"{args.min_cmd:g} count for the ratio.\n")
-  w("| mph | active s | cmd p50 | cmd p95 | cmd max | eps p50 | eps p95 | eps max | eps/cmd (median) |")
-  w("|---|---|---|---|---|---|---|---|---|")
-  for lo, hi in ((0, 25), (25, 45), (45, 60), (60, 80), (80, 200)):
-    m = active & (v >= lo * MPH) & (v < hi * MPH)
-    if m.sum() < 20:
-      continue
-    c, e = np.abs(cmd_can[m]), np.abs(eps[m])
-    big = c > args.min_cmd
-    ratio = f"{np.median(e[big] / c[big]):.2f}" if big.sum() >= 20 else "-"
-    w(f"| {lo}-{hi} | {m.sum() / hz:.0f} | {np.median(c):.0f} | {np.percentile(c, 95):.0f} | {c.max():.0f} "
-      f"| {np.median(e):.0f} | {np.percentile(e, 95):.0f} | {e.max():.0f} | {ratio} |")
-  sat = (np.abs(cmd_can[active]) >= 0.98 * args.steer_max).mean() * 100
-  w(f"\n- command at >=98% of steer_max ({args.steer_max:g}): {sat:.1f}% of active samples")
-
-  # --- actuator lag -------------------------------------------------------------------------
-  lag, r = estimate_lag(cmd_can[active], eps[active], hz)
-  w("\n## Actuator lag\n")
-  if r:
-    w(f"- best cross-correlation of cmd vs EPS torque: lag **{lag:.2f} s** (r = {r:+.2f}); current steerActuatorDelay is 0.15 s")
-    w(f"- resolution is 1/{hz:g} s; a negative r just means the EPS reports torque with the opposite sign convention")
-  else:
-    w("- not enough steering variation to estimate lag")
-
-  # --- assist fade --------------------------------------------------------------------------
-  win = max(3, int(args.fade_window * hz))
-  c_med = pd.Series(np.abs(cmd_can)).rolling(win, center=True, min_periods=1).median().to_numpy()
-  e_med = pd.Series(np.abs(eps)).rolling(win, center=True, min_periods=1).median().to_numpy()
-  usable = active & (c_med > args.min_cmd)
-  eff = np.full(len(df), np.nan)
-  eff[usable] = e_med[usable] / c_med[usable]
-  base = np.nanmedian(eff) if np.isfinite(eff).any() else np.nan
-  eff_rel = eff / base if base else eff
-  fade_mask = np.nan_to_num(eff_rel, nan=9) < args.fade_thresh
-  eps_fade = runs(fade_mask & usable, int(args.fade_min_s * hz))
-  df["eff_rel"] = eff_rel
-
-  w("\n## Assist fade\n")
-  w(f"Efficiency = rolling median |EPS torque| / |command| over {args.fade_window:g} s, relative to this drive's median "
-    f"({base:.2f}). A fade is efficiency below {args.fade_thresh:g}x baseline for >= {args.fade_min_s:g} s while the command "
-    f"stays above {args.min_cmd:g}.\n")
   fault = df.steerFaultTemporary.fillna(0).to_numpy() > 0
   edges = np.where(np.diff(np.r_[0, fault.astype(np.int8)]) == 1)[0]
-  if eps_fade:
-    w("| start | length s | mph | mean cmd | mean eps | steerFaultTemporary during |")
-    w("|---|---|---|---|---|---|")
-    for s, e in eps_fade:
-      when = fmt_time(df.wall.iloc[s]) if "wall" in df else f"t={df.t.iloc[s]:.1f}"
-      w(f"| {when} | {(e - s) / hz:.1f} | {v[s:e].mean() / MPH:.0f} "
-        f"| {np.abs(cmd_can[s:e]).mean():.0f} | {np.abs(eps[s:e]).mean():.0f} | {'yes' if fault[s:e].any() else 'no'} |")
+  eps_fade = []
+  eff_rel = np.full(len(df), np.nan)
+  if not have_eps:
+    w("\n## EPS authority\n")
+    w("**No EPS motor torque in these logs** (neither `STEER_MOTOR_TORQUE` on CAN nor `carState.steeringTorqueEps` is "
+      "non-zero while lateral-active), so the authority, lag and assist-fade analysis is skipped. Honda's carState does not "
+      "fill `steeringTorqueEps`; `extract` decodes 0x1AB from the rlog `can` events, so re-run `extract` on rlogs "
+      "(qlog is decimated and may not carry it).")
   else:
-    w("No fade episodes detected.")
+    # --- authority per speed bin --------------------------------------------------------------
+    w("\n## EPS authority by speed\n")
+    w("Commanded torque is carOutput.actuatorsOutput.torque * steer_max (CAN units). EPS torque is "
+      + ("STEER_MOTOR_TORQUE decoded from CAN (10-bit magnitude, not the same units as the command, so read the ratio against "
+         "this drive's own baseline)" if unsigned else "carState.steeringTorqueEps")
+      + f". Only samples where |cmd| > {args.min_cmd:g} count for the ratio.\n")
+    w("| mph | active s | cmd p50 | cmd p95 | cmd max | eps p50 | eps p95 | eps max | eps/cmd (median) |")
+    w("|---|---|---|---|---|---|---|---|---|")
+    for lo, hi in ((0, 25), (25, 45), (45, 60), (60, 80), (80, 200)):
+      m = active & (v >= lo * MPH) & (v < hi * MPH)
+      if m.sum() < 20:
+        continue
+      c, e = np.abs(cmd_can[m]), np.abs(eps[m])
+      big = c > args.min_cmd
+      ratio = f"{np.median(e[big] / c[big]):.2f}" if big.sum() >= 20 else "-"
+      w(f"| {lo}-{hi} | {m.sum() / hz:.0f} | {np.median(c):.0f} | {np.percentile(c, 95):.0f} | {c.max():.0f} "
+        f"| {np.median(e):.0f} | {np.percentile(e, 95):.0f} | {e.max():.0f} | {ratio} |")
+    sat = (np.abs(cmd_can[active]) >= 0.98 * args.steer_max).mean() * 100
+    w(f"\n- command at >=98% of steer_max ({args.steer_max:g}): {sat:.1f}% of active samples")
+
+    # --- actuator lag -------------------------------------------------------------------------
+    lag, r = estimate_lag(np.abs(cmd_can[active]) if unsigned else cmd_can[active], eps[active], hz)
+    w("\n## Actuator lag\n")
+    if r:
+      w(f"- best cross-correlation of cmd vs EPS torque: lag **{lag:.2f} s** (r = {r:+.2f}); current steerActuatorDelay is 0.15 s")
+      w(f"- resolution is 1/{hz:g} s; " + ("both signals are compared as magnitudes (the EPS torque has no sign)" if unsigned else
+        "a negative r just means the EPS reports torque with the opposite sign convention"))
+    else:
+      w("- not enough steering variation to estimate lag")
+
+    # --- assist fade --------------------------------------------------------------------------
+    win = max(3, int(args.fade_window * hz))
+    c_med = pd.Series(np.abs(cmd_can)).rolling(win, center=True, min_periods=1).median().to_numpy()
+    e_med = pd.Series(np.abs(eps)).rolling(win, center=True, min_periods=1).median().to_numpy()
+    usable = active & (c_med > args.min_cmd)
+    eff = np.full(len(df), np.nan)
+    eff[usable] = e_med[usable] / c_med[usable]
+    base = np.nanmedian(eff) if np.isfinite(eff).any() else np.nan
+    eff_rel = eff / base if base else eff
+    fade_mask = np.nan_to_num(eff_rel, nan=9) < args.fade_thresh
+    eps_fade = runs(fade_mask & usable, int(args.fade_min_s * hz))
+    df["eff_rel"] = eff_rel
+
+
+    w("\n## Assist fade\n")
+    w(f"Efficiency = rolling median |EPS torque| / |command| over {args.fade_window:g} s, relative to this drive's median "
+      f"({base:.2f}). A fade is efficiency below {args.fade_thresh:g}x baseline for >= {args.fade_min_s:g} s while the command "
+      f"stays above {args.min_cmd:g}.\n")
+    if eps_fade:
+      w("| start | length s | mph | mean cmd | mean eps | steerFaultTemporary during |")
+      w("|---|---|---|---|---|---|")
+      for s, e in eps_fade:
+        when = fmt_time(df.wall.iloc[s]) if "wall" in df else f"t={df.t.iloc[s]:.1f}"
+        w(f"| {when} | {(e - s) / hz:.1f} | {v[s:e].mean() / MPH:.0f} "
+          f"| {np.abs(cmd_can[s:e]).mean():.0f} | {np.abs(eps[s:e]).mean():.0f} | {'yes' if fault[s:e].any() else 'no'} |")
+    else:
+      w("No fade episodes detected.")
+
+    if eps_fade and {"steeringTorque", "steeringPressed", "steeringAngleDeg"} <= set(df.columns):
+      # driver vs motor: is someone holding the wheel while the command is high and the motor is low?
+      tq = df.steeringTorque.fillna(0).to_numpy()
+      pr = df.steeringPressed.fillna(0).to_numpy() > 0
+      ang = pd.Series(df.steeringAngleDeg.fillna(0).to_numpy()).rolling(5, center=True, min_periods=1).mean().to_numpy()
+      rate = np.gradient(ang) * hz
+      infade = np.zeros(len(df), dtype=bool)
+      for s_, e_ in eps_fade:
+        infade[s_:e_] = True
+      w("\n### Driver vs motor during fades\n")
+      w("`steeringTorque` is the torsion-bar sensor: it rises when the EPS fails to follow a hard request, whoever is holding the "
+        "wheel, so a high value is not proof the driver is fighting. Low `steeringPressed` with a high command and a "
+        "near-zero motor torque is the stronger sign of the motor not following. `corr` is the correlation of command "
+        "and driver torque (negative = opposed).\n")
+      w("| start | length s | mph | mean cmd | mean eps | mean driver tq | pressed | mean wheel rate deg/s | corr |")
+      w("|---|---|---|---|---|---|---|---|---|")
+      for s_, e_ in eps_fade:
+        c_, t_ = cmd_can[s_:e_], tq[s_:e_]
+        cc = np.corrcoef(c_, t_)[0, 1] if c_.std() > 0 and t_.std() > 0 else float("nan")
+        when = fmt_time(df.wall.iloc[s_]) if "wall" in df else f"t={df.t.iloc[s_]:.1f}"
+        w(f"| {when} | {(e_ - s_) / hz:.1f} | {v[s_:e_].mean() / MPH:.0f} | {np.abs(c_).mean():.0f} | {np.abs(eps[s_:e_]).mean():.1f} "
+          f"| {np.abs(t_).mean():.0f} | {pr[s_:e_].mean() * 100:.0f}% | {np.abs(rate[s_:e_]).mean():.0f} | {cc:+.2f} |")
+      hi = active & (c_med > 2500) & ~infade
+      w("\n| samples | seconds | mean driver tq | pressed | mean eps |")
+      w("|---|---|---|---|---|")
+      for name, m in (("all lateral-active", active), ("high command (>2500), not in a fade", hi), ("in a fade", infade)):
+        if m.sum():
+          w(f"| {name} | {m.sum() / hz:.0f} | {np.abs(tq[m]).mean():.0f} | {pr[m].mean() * 100:.0f}% | {np.abs(eps[m]).mean():.1f} |")
   w(f"\n- steerFaultTemporary rising edges: {len(edges)} (the LOW_SPEED_LOCKOUT check is one cause among several)")
   for i in edges[:10]:
     w(f"  - {fmt_time(df.wall.iloc[i]) if 'wall' in df else f't={df.t.iloc[i]:.1f}'} at {v[i] / MPH:.0f} mph")
+
+  # --- STEER_STATUS -------------------------------------------------------------------------
+  if "steer_status" in df and df.steer_status.notna().any():
+    st = df.steer_status.fillna(-1).to_numpy().astype(int)
+    w("\n## STEER_STATUS while lateral-active\n")
+    w(f"Raw EPS status broadcast (0x18F), lateral-active above {args.min_speed:g} mph. `eps/cmd` is the median EPS-torque over "
+      "command ratio (cmd above the minimum) in that state, to show whether assist really drops in a given status.\n")
+    w("| status | seconds | share | eps/cmd (median) |")
+    w("|---|---|---|---|")
+    for code in sorted(set(st[active])):
+      m = active & (st == code)
+      big = m & (np.abs(cmd_can) > args.min_cmd)
+      ratio = f"{np.median(np.abs(eps[big]) / np.abs(cmd_can[big])):.2f}" if have_eps and big.sum() >= 20 else "-"
+      w(f"| {STEER_STATUS_NAMES.get(code, 'missing' if code < 0 else f'unknown_{code}')} | {m.sum() / hz:.0f} "
+        f"| {m.sum() / max(active.sum(), 1) * 100:.1f}% | {ratio} |")
+    lock = active & (st == 3)
+    if lock.any():
+      starts = np.where(np.diff(np.r_[0, lock.astype(np.int8)]) == 1)[0]
+      w(f"\n- low_speed_lockout episodes while lateral-active: {len(starts)}; "
+        f"{(fault[lock]).mean() * 100:.0f}% of that time steerFaultTemporary was also set")
 
   # --- radar --------------------------------------------------------------------------------
   if "lead_present" in df:
     w("\n## Radar / lead\n")
     st = df.lead_present.fillna(0).to_numpy() > 0
-    w(f"- lead present: {st.mean() * 100:.1f}% of the drive")
+    w(f"- lead present: {st.sum() / nvalid * 100:.1f}% of the drive")
     if st.any():
       w(f"- of that, radar-matched (not vision-only): {(df.lead_radar.fillna(0).to_numpy()[st] > 0).mean() * 100:.0f}%")
       w(f"- lead distance: median {df.lead_dRel[st].median():.0f} m, min {df.lead_dRel[st].min():.0f} m; "

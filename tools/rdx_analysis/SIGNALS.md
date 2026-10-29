@@ -15,7 +15,10 @@ value of each at that moment.
 | `vEgo` | `carState` | m/s | vehicle speed | EPS assist and the `LOW_SPEED_LOCKOUT` issue are speed dependent |
 | `steeringAngleDeg` | `carState` | deg | steering wheel angle | context for tight curves |
 | `steeringTorque` | `carState` | CAN units | driver torque on the wheel | high values mean the driver is fighting or helping |
-| `steeringTorqueEps` | `carState` | CAN units | the EPS motor's reported torque (Honda `STEER_MOTOR_TORQUE`) | **the key number**: what the EPS actually delivers |
+| `steeringTorqueEps` | `carState` | CAN units | **always 0 on Honda**: openpilot's Honda carState never fills it | kept only for non-Honda logs; the report falls back to it when `eps_motor` is absent |
+| `eps_motor` | raw `can`, addr 0x1AB (`STEER_MOTOR_TORQUE`) | EPS units, 0-1023 | the EPS motor torque, 10-bit unsigned magnitude (no sign), 50 Hz | **the key number**: what the EPS actually delivers. Not the same scale as the command (RDX 3G: roughly 1/50 of it) |
+| `steer_status` | raw `can`, addr 0x18F (`STEER_STATUS`) | code 0-7 | EPS status: 0 normal, 1 driver_steering, 2 no_torque_alert_1, 3 low_speed_lockout, 4 no_torque_alert_2, 5 fault_1, 6 tmp_fault, 7 permanent_fault | shows `LOW_SPEED_LOCKOUT` directly, independent of the carState fault flag |
+| `steer_ctrl_active` | raw `can`, addr 0x18F | bool | EPS reports it is applying openpilot's torque request | context |
 | `steeringPressed` | `carState` | bool | driver is overriding | excludes driver-caused apparent fades |
 | `steerFaultTemporary` | `carState` | bool | temporary steer fault | on the RDX 3G this also flags `LOW_SPEED_LOCKOUT` above the minimum steer speed (the silent assist-loss fix) |
 | `steerFaultPermanent` | `carState` | bool | permanent steer fault | should stay false |
@@ -43,7 +46,7 @@ For lateral-active samples, grouped into speed bins (mph):
 
 - **cmd p50 / p95 / max** are the commanded torque in CAN units (`cmd_torque * steer-max`),
   absolute value.
-- **eps p50 / p95 / max** are the absolute `steeringTorqueEps`.
+- **eps p50 / p95 / max** are the absolute EPS torque (`eps_motor`, else `steeringTorqueEps`).
 - **eps/cmd (median)** is the median of EPS torque over command, only for samples where the
   command exceeds `--min-cmd`. This is roughly how much of the request the EPS delivers.
   A falling ratio at higher speed points to reduced authority.
@@ -52,7 +55,7 @@ For lateral-active samples, grouped into speed bins (mph):
 
 ### Actuator lag
 
-Cross-correlates the signed command with the signed EPS torque over lag 0-0.6 s and reports
+Cross-correlates the command with the EPS torque over lag 0-0.6 s (as magnitudes when the EPS torque comes from `eps_motor`, which has no sign; signed otherwise) and reports
 the lag with the strongest correlation, plus the correlation `r`. Compare this with
 `steerActuatorDelay` (0.15 s on this branch). `r` of small magnitude means the signals did not
 track each other, so do not trust the lag.
@@ -70,7 +73,23 @@ Each fade row shows start time, length, mean speed, mean command and EPS torque,
 for the `LOW_SPEED_LOCKOUT` problem: the EPS keeps reporting `LOW_SPEED_LOCKOUT` while its motor
 torque decays toward zero over 8-15 seconds at 58-80 mph.
 
+### Driver vs motor during fades
+
+For each fade: mean driver torque, the share of the fade with `steeringPressed`, mean wheel rate,
+and the correlation between command and driver torque (negative means opposed). A second table
+compares all lateral-active samples, high-command samples outside fades, and fade samples.
+`steeringTorque` is the torsion-bar sensor, so it rises when the EPS fails to follow a hard
+request regardless of who holds the wheel; low `steeringPressed` with a high command and
+near-zero motor torque is the stronger sign of the motor not following.
+
 The report also lists every `steerFaultTemporary` rising edge with time and speed.
+
+### STEER_STATUS while lateral-active
+
+Seconds and share of lateral-active time in each raw EPS status, with the median EPS/command
+ratio in that status, and the number of `low_speed_lockout` episodes. A lockout at speed with a
+collapsing ratio is the silent assist loss. If this table is all `normal`, that failure did not
+happen in the drive, whatever `steerFaultTemporary` did at low speed.
 
 ### Radar / lead
 
@@ -168,4 +187,6 @@ not rely on them without testing.
 
 Steering torque or motor current, EPS temperature or voltage, EPS status, radar objects,
 camera. For the EPS, the broadcast CAN messages (`STEER_STATUS`, `STEER_MOTOR_TORQUE`) are the
-source, and they are already in the comma logs through `carState`.
+source. `carState` does not carry the motor torque on Honda, so `extract` decodes both frames from
+the rlog `can` events (0x1AB and 0x18F; layouts from opendbc `_honda_common.dbc` and
+`_bosch_2018.dbc`; checksums are not verified). qlog is decimated and may not carry them.

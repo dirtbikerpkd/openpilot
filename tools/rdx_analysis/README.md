@@ -10,8 +10,8 @@ up with anything the engine or car was doing at the time.
 Everything here is **read-only**. It never sends anything to the car, and the only thing it
 does to the device is copy log files off it.
 
-> Status: validated only against a synthetic log (see [Testing](#testing)). It has not yet been
-> run on a real drive, so treat the thresholds as starting points and expect to tune them.
+> Status: the synthetic test passes (see [Testing](#testing)) and `extract` has run on one real set of
+> RDX 3G drives (2026-10-28/29). Treat the fade thresholds as starting points and expect to tune them.
 
 ## Requirements
 
@@ -105,12 +105,17 @@ bus.
 
 ## Limits worth knowing
 
+- **EPS torque source.** Honda's carState never fills `steeringTorqueEps` (it is always 0), so
+  `extract` decodes `STEER_MOTOR_TORQUE` (0x1AB) and `STEER_STATUS` (0x18F) from the rlog `can`
+  events. Use rlogs, not qlogs. If no EPS torque is found the report says so and skips the
+  authority, lag and fade sections instead of printing zeros.
 - **Torque units.** `carOutput` torque is a normalized command that the script scales by
-  `--steer-max`. `steeringTorqueEps` is Honda's native `STEER_MOTOR_TORQUE`. They are not
-  guaranteed to share a scale, so ratios are compared against the drive's own baseline
-  rather than judged absolutely.
-- **Sign.** Honda's torque sign convention may differ between command and report. The lag
-  estimate uses the strongest correlation of either sign and prints it.
+  `--steer-max`. `STEER_MOTOR_TORQUE` is a different scale (on the RDX 3G the EPS/command ratio
+  is about 0.02), so ratios are compared against the drive's own baseline rather than judged
+  absolutely.
+- **Sign.** `STEER_MOTOR_TORQUE` is an unsigned magnitude, so lag is estimated on magnitudes.
+- **Checksums.** CAN checksums are not verified. A corrupt frame would show as a one-sample spike.
+- **Percentages.** They use real driving time only; gaps between drives are excluded.
 - **Fade detection is a heuristic.** Hard driver input, tight curves, or a rough road can look
   like low efficiency. Fades that coincide with `steerFaultTemporary` are the strongest
   candidates.
@@ -126,9 +131,11 @@ bus.
 uv run --python 3.12 tools/rdx_analysis/test_rdx_analysis.py
 ```
 
-Builds a synthetic 90 s rlog with a known 0.15 s EPS lag, one assist fade with a fault, and a
-lead vehicle, plus a matching OBD CSV. The test checks that the analysis recovers the lag, the
-fade, the fault, the radar share, and the OBD alignment and ranking.
+Builds a synthetic 90 s rlog with a known 0.15 s EPS lag (EPS torque carried as raw CAN frames,
+like a real Honda log), one assist fade with `low_speed_lockout` and a fault, and a lead vehicle,
+plus a matching OBD CSV. The test checks that the analysis recovers the lag, the fade, the fault,
+the status table, the radar share, and the OBD alignment and ranking, and that CAN loopback
+frames are ignored.
 
 OBD signal descriptions are based on the community-maintained
 [OBDb/Acura-RDX](https://github.com/OBDb/Acura-RDX) signal set (CC-BY-SA-4.0).

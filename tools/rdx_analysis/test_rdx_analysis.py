@@ -56,11 +56,24 @@ def build_rlog(path):
     add(t, "carOutput", lambda m, c=cmd: setattr(m.actuatorsOutput, "torque", float(c / STEER_MAX)))
     add(t, "carControl", lambda m: setattr(m, "latActive", True))
 
-    def cs(m, eps=eps, in_fade=in_fade):
+    def cs(m, in_fade=in_fade):
+      # like the real car: carState.steeringTorqueEps stays 0; the EPS torque is only on CAN
       m.vEgo = 28.0
-      m.steeringTorqueEps = float(eps)
       m.steerFaultTemporary = bool(in_fade and t > FADE[0] + 3.0)
     add(t, "carState", cs)
+    if i % 2 == 0:  # 50 Hz, like the real STEER_MOTOR_TORQUE
+      mt = int(min(1023, abs(eps) / 4))  # 10-bit magnitude, different scale from the command
+      status = 3 if (in_fade and t > FADE[0] + 3.0) else 0
+      def frames(m, mt=mt, status=status):
+        m[0].address, m[0].src = ra.ADDR_STEER_MOTOR_TORQUE, 1
+        m[0].dat = bytes([(mt >> 8) & 3, mt & 0xFF, 0])
+        m[1].address, m[1].src = ra.ADDR_STEER_STATUS, 1
+        m[1].dat = bytes([0, 0, 0, 0, status << 4, 0, 0])
+        m[2].address, m[2].src = ra.ADDR_STEER_MOTOR_TORQUE, 129  # sendcan loopback, must be ignored
+        m[2].dat = bytes([3, 255, 0])
+      ev = log.Event.new_message(logMonoTime=int((MONO0 + t) * 1e9))
+      frames(ev.init("can", 3))
+      out.extend(ev.to_bytes())
     if i % 5 == 0 and t < 30:
       def lead(m):
         m.leadOne.present = True
@@ -112,7 +125,7 @@ class TestRdxAnalysis(unittest.TestCase):
     self.assertAlmostEqual(lag, LAG_S, delta=0.05)
 
   def test_single_fade_found_with_fault(self):
-    fade_rows = [ln for ln in self.text.split("## Assist fade")[1].split("## Radar")[0].splitlines()
+    fade_rows = [ln for ln in self.text.split("## Assist fade")[1].split("### Driver vs motor")[0].splitlines()
                  if ln.startswith("| 20")]
     self.assertEqual(len(fade_rows), 1, self.text)
     self.assertTrue(fade_rows[0].rstrip("| ").endswith("yes"))
@@ -133,6 +146,30 @@ class TestRdxAnalysis(unittest.TestCase):
     section = self.text.split("## OBD covariates")[1]
     first = next(ln for ln in section.splitlines() if ln.startswith("| RDX_"))
     self.assertTrue(first.startswith("| RDX_AAT_FIRSTGEN"), first)
+
+  def test_motor_torque_decoded_from_can(self):
+    d = pd.read_csv(self.drive)
+    self.assertGreater(d.eps_motor.max(), 100)
+    self.assertLess(d.eps_motor.max(), 1024)  # the 1023 loopback frame was ignored
+    self.assertTrue((d.steeringTorqueEps.fillna(0) == 0).all())
+    self.assertIn("decoded from CAN", self.text)
+
+  def test_steer_status_table(self):
+    section = self.text.split("## STEER_STATUS")[1].split("## Radar")[0]
+    self.assertIn("| low_speed_lockout |", section)
+    self.assertIn("| normal |", section)
+    self.assertIn("low_speed_lockout episodes while lateral-active: 1", section)
+
+  def test_driver_vs_motor_section(self):
+    section = self.text.split("### Driver vs motor during fades")[1].split("## STEER_STATUS")[0]
+    self.assertEqual(len([ln for ln in section.splitlines() if ln.startswith("| 20")]), 1, section)
+    self.assertIn("| in a fade |", section)
+    self.assertIn("| all lateral-active |", section)
+
+  def test_decoders(self):
+    self.assertEqual(ra.decode_motor_torque(bytes([0x02, 0x34, 0x00])), 0x234)
+    self.assertEqual(ra.decode_steer_status(bytes([0, 0, 0, 0, 0x38, 0, 0])), (3, 1))
+    self.assertIsNone(ra.decode_motor_torque(b""))
 
   def test_authority_table_present(self):
     self.assertIn("EPS authority by speed", self.text)
