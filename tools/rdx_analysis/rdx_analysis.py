@@ -124,7 +124,7 @@ def _lead(ld):
 
 def extract(paths):
   """Returns (DataFrame of per-service samples keyed on monotonic seconds, wall-clock offset or None)."""
-  rows = {k: [] for k in ("carState", "carOutput", "carControl", "radarState", "selfdriveState", "epsMotor", "steerStatus")}
+  rows = {k: [] for k in ("carState", "carOutput", "carControl", "radarState", "selfdriveState", "epsMotor", "steerStatus", "controlsState")}
   offsets = []
   for f in find_logs(paths):
     for ev in read_events(f):
@@ -142,6 +142,15 @@ def extract(paths):
         rows[w].append((t, *_lead(ev.radarState.leadOne)))
       elif w == "selfdriveState":
         rows[w].append((t, ev.selfdriveState.enabled, ev.selfdriveState.active))
+      elif w == "controlsState":
+        c = ev.controlsState
+        ls = c.lateralControlState
+        kind = ls.which()
+        st = getattr(ls, kind)
+        pid = kind == "pidState"
+        rows[w].append((t, c.curvature, c.desiredCurvature,
+                        st.steeringAngleDesiredDeg if pid else np.nan, st.angleError if pid else np.nan,
+                        getattr(st, "output", np.nan), getattr(st, "saturated", False)))
       elif w == "can":
         for c in ev.can:
           if c.src >= 128:  # loopback of our own sendcan
@@ -165,6 +174,7 @@ def extract(paths):
     "carControl": ["t", "latActive"],
     "radarState": ["t", "lead_present", "lead_radar", "lead_dRel", "lead_vLead", "lead_vRel"],
     "selfdriveState": ["t", "sd_enabled", "sd_active"],
+    "controlsState": ["t", "curvature", "desiredCurvature", "angle_des_deg", "angle_err_deg", "lat_output", "lat_saturated"],
     "epsMotor": ["t", "eps_motor"],
     "steerStatus": ["t", "steer_status", "steer_ctrl_active"],
   }
@@ -260,6 +270,12 @@ def estimate_lag(cmd, eps, hz, max_lag_s=0.6):
   return best
 
 
+def fmt_short(frac, turning):
+  """Mean under-steer share over the turning samples of a window, as text."""
+  m = turning & np.isfinite(frac)
+  return f"{np.mean(frac[m]) * 100:.0f}%" if m.sum() >= 10 else "-"
+
+
 def fmt_time(wall):
   if wall is None or not np.isfinite(wall):
     return "n/a"
@@ -279,6 +295,18 @@ def analyze(df, args, hz):
   unsigned = eps_col == "eps_motor"  # STEER_MOTOR_TORQUE is a 10-bit magnitude
   active = lat & (v > args.min_speed * MPH)
   have_eps = bool(np.abs(eps[active]).max() > 0) if active.any() else False
+
+  # Lateral tracking: positive shortfall = the car is turning less than the (lag-adjusted) desired curvature.
+  have_track = "desiredCurvature" in df and df.desiredCurvature.notna().any()
+  if have_track:
+    des = df.desiredCurvature.fillna(0).to_numpy()
+    act_c = df.curvature.fillna(0).to_numpy()
+    short = np.sign(des) * (des - act_c)
+    short_frac = short / np.maximum(np.abs(des), 1e-6)
+    turning = active & (np.abs(des) > args.min_curv)
+  else:
+    short_frac = np.full(len(df), np.nan)
+    turning = np.zeros(len(df), dtype=bool)
   # The grid spans boot gaps between drives (carState rows are NaN there); only count real driving time.
   valid = df.vEgo.notna().to_numpy()
   nvalid = max(int(valid.sum()), 1)
@@ -376,15 +404,17 @@ def analyze(df, args, hz):
       w("`steeringTorque` is the torsion-bar sensor: it rises when the EPS fails to follow a hard request, whoever is holding the "
         "wheel, so a high value is not proof the driver is fighting. Low `steeringPressed` with a high command and a "
         "near-zero motor torque is the stronger sign of the motor not following. `corr` is the correlation of command "
-        "and driver torque (negative = opposed).\n")
-      w("| start | length s | mph | mean cmd | mean eps | mean driver tq | pressed | mean wheel rate deg/s | corr |")
-      w("|---|---|---|---|---|---|---|---|---|")
+        "and driver torque (negative = opposed). `under-steer` is how much less than the desired curvature the car achieved "
+      "(see Lateral tracking), `-` if the fade is not in a turn.\n")
+      w("| start | length s | mph | mean cmd | mean eps | mean driver tq | pressed | mean wheel rate deg/s | corr | under-steer |")
+      w("|---|---|---|---|---|---|---|---|---|---|")
       for s_, e_ in eps_fade:
         c_, t_ = cmd_can[s_:e_], tq[s_:e_]
         cc = np.corrcoef(c_, t_)[0, 1] if c_.std() > 0 and t_.std() > 0 else float("nan")
         when = fmt_time(df.wall.iloc[s_]) if "wall" in df else f"t={df.t.iloc[s_]:.1f}"
         w(f"| {when} | {(e_ - s_) / hz:.1f} | {v[s_:e_].mean() / MPH:.0f} | {np.abs(c_).mean():.0f} | {np.abs(eps[s_:e_]).mean():.1f} "
-          f"| {np.abs(t_).mean():.0f} | {pr[s_:e_].mean() * 100:.0f}% | {np.abs(rate[s_:e_]).mean():.0f} | {cc:+.2f} |")
+          f"| {np.abs(t_).mean():.0f} | {pr[s_:e_].mean() * 100:.0f}% | {np.abs(rate[s_:e_]).mean():.0f} | {cc:+.2f} "
+          f"| {fmt_short(short_frac[s_:e_], turning[s_:e_])} |")
       hi = active & (c_med > 2500) & ~infade
       w("\n| samples | seconds | mean driver tq | pressed | mean eps |")
       w("|---|---|---|---|---|")
@@ -394,6 +424,49 @@ def analyze(df, args, hz):
   w(f"\n- steerFaultTemporary rising edges: {len(edges)} (the LOW_SPEED_LOCKOUT check is one cause among several)")
   for i in edges[:10]:
     w(f"  - {fmt_time(df.wall.iloc[i]) if 'wall' in df else f't={df.t.iloc[i]:.1f}'} at {v[i] / MPH:.0f} mph")
+
+  # --- lateral tracking ---------------------------------------------------------------------
+  if have_track:
+    w("\n## Lateral tracking (did the car turn as much as openpilot wanted?)\n")
+    w(f"`controlsState.desiredCurvature` (lag-adjusted) vs `curvature` (achieved). Shortfall = how much less the car turned, as a share of "
+      f"the desired curvature, only where |desired| > {args.min_curv:g} 1/m (radius under {1 / args.min_curv:.0f} m) and lateral-active above "
+      f"{args.min_speed:g} mph. Under-steer = shortfall above {args.under_frac * 100:.0f}%.\n")
+    w("| mph | turning s | under-steer share | median shortfall | p95 shortfall | command at ceiling during under-steer |")
+    w("|---|---|---|---|---|---|")
+    under = turning & (short_frac > args.under_frac)
+    cmd_sat = np.abs(cmd_can) >= 0.98 * args.steer_max
+    for lo, hi in ((20, 45), (45, 60), (60, 80), (80, 200)):
+      m = turning & (v >= lo * MPH) & (v < hi * MPH)
+      if m.sum() < 20:
+        continue
+      u = m & under
+      sat_u = f"{cmd_sat[u].mean() * 100:.0f}%" if u.sum() else "-"
+      w(f"| {lo}-{hi} | {m.sum() / hz:.0f} | {u.sum() / m.sum() * 100:.1f}% | {np.median(short_frac[m]) * 100:.0f}% "
+        f"| {np.percentile(short_frac[m], 95) * 100:.0f}% | {sat_u} |")
+    eps_ep = runs(under, int(args.under_min_s * hz))
+    pressed_all = df.steeringPressed.fillna(0).to_numpy() > 0 if "steeringPressed" in df else np.zeros(len(df), dtype=bool)
+    w(f"\nUnder-steer episodes of at least {args.under_min_s:g} s: **{len(eps_ep)}**. Label is a heuristic: `assist-limited` = driver "
+      "pressed under 25% of the time (the car fell short without you pushing), `driver-involved` = pressed 50% or more "
+      "(you were likely correcting), `mixed` otherwise.\n")
+    if eps_ep:
+      w("| start | length s | mph | radius m | mean shortfall | mean cmd | at ceiling | mean eps | pressed | angle err deg | label |")
+      w("|---|---|---|---|---|---|---|---|---|---|---|")
+      counts = {"assist-limited": 0, "mixed": 0, "driver-involved": 0}
+      for s_, e_ in eps_ep:
+        pc = pressed_all[s_:e_].mean()
+        label = "assist-limited" if pc < 0.25 else "driver-involved" if pc >= 0.5 else "mixed"
+        counts[label] += 1
+        when = fmt_time(df.wall.iloc[s_]) if "wall" in df else f"t={df.t.iloc[s_]:.1f}"
+        ae = df.angle_err_deg.iloc[s_:e_].abs().mean() if "angle_err_deg" in df else float("nan")
+        w(f"| {when} | {(e_ - s_) / hz:.1f} | {v[s_:e_].mean() / MPH:.0f} | {1 / np.abs(des[s_:e_]).mean():.0f} "
+          f"| {np.mean(short_frac[s_:e_]) * 100:.0f}% | {np.abs(cmd_can[s_:e_]).mean():.0f} | {cmd_sat[s_:e_].mean() * 100:.0f}% "
+          f"| {np.abs(eps[s_:e_]).mean():.1f} | {pc * 100:.0f}% | {ae:.1f} | {label} |")
+      w(f"\n- by label: {counts['assist-limited']} assist-limited, {counts['mixed']} mixed, {counts['driver-involved']} driver-involved")
+      fade_ids = np.zeros(len(df), dtype=bool)
+      for s_, e_ in eps_fade:
+        fade_ids[s_:e_] = True
+      both = sum(fade_ids[s_:e_].any() for s_, e_ in eps_ep)
+      w(f"- {both} of these episodes overlap an assist-fade episode (command high, motor torque low)")
 
   # --- STEER_STATUS -------------------------------------------------------------------------
   if "steer_status" in df and df.steer_status.notna().any():
@@ -508,6 +581,9 @@ def main(argv=None):
   a.add_argument("--fade-window", type=float, default=1.0)
   a.add_argument("--fade-thresh", type=float, default=0.3, help="fade = efficiency below this fraction of baseline")
   a.add_argument("--fade-min-s", type=float, default=2.0)
+  a.add_argument("--min-curv", type=float, default=0.002, help="desired |curvature| (1/m) above which a sample counts as a turn")
+  a.add_argument("--under-frac", type=float, default=0.3, help="under-steer = achieved curvature short of desired by this fraction")
+  a.add_argument("--under-min-s", type=float, default=1.0, help="minimum under-steer episode length in seconds")
   a.add_argument("-o", "--out", help="also write the report here")
   a.add_argument("--merged-csv", help="write the drive+OBD merged table here")
   a.set_defaults(fn=cmd_report)

@@ -30,6 +30,7 @@ STEER_MAX = 4095
 WALL0 = dt.datetime(2026, 11, 2, 14, 0, 0, tzinfo=dt.timezone.utc).timestamp()
 MONO0 = 5000.0
 FADE = (50.0, 58.0)
+UNDER = (62.0, 68.0)  # under-steer window around the desired-curvature peak at t=65 s
 
 
 def build_rlog(path):
@@ -61,6 +62,13 @@ def build_rlog(path):
       m.vEgo = 28.0
       m.steerFaultTemporary = bool(in_fade and t > FADE[0] + 3.0)
     add(t, "carState", cs)
+
+    def ctl(m, t=t):
+      des = 0.004 * np.sin(2 * np.pi * t / 20.0)
+      m.desiredCurvature = float(des)
+      m.curvature = float(0.4 * des if UNDER[0] <= t < UNDER[1] else des)  # car turns 60% less than wanted in the window
+      m.lateralControlState.init("pidState").angleError = float(abs(des) * 100)
+    add(t, "controlsState", ctl)
     if i % 2 == 0:  # 50 Hz, like the real STEER_MOTOR_TORQUE
       mt = int(min(1023, abs(eps) / 4))  # 10-bit magnitude, different scale from the command
       status = 3 if (in_fade and t > FADE[0] + 3.0) else 0
@@ -161,10 +169,19 @@ class TestRdxAnalysis(unittest.TestCase):
     self.assertIn("low_speed_lockout episodes while lateral-active: 1", section)
 
   def test_driver_vs_motor_section(self):
-    section = self.text.split("### Driver vs motor during fades")[1].split("## STEER_STATUS")[0]
+    section = self.text.split("### Driver vs motor during fades")[1].split("## Lateral tracking")[0]
     self.assertEqual(len([ln for ln in section.splitlines() if ln.startswith("| 20")]), 1, section)
     self.assertIn("| in a fade |", section)
     self.assertIn("| all lateral-active |", section)
+
+  def test_lateral_tracking_finds_one_understeer_episode(self):
+    section = self.text.split("## Lateral tracking")[1].split("## STEER_STATUS")[0]
+    self.assertIn("Under-steer episodes of at least 1 s: **1**", section)
+    row = next(ln for ln in section.splitlines() if ln.startswith("| 20"))
+    cols = [c.strip() for c in row.split("|")[1:-1]]
+    self.assertAlmostEqual(float(cols[1]), 6.0, delta=0.5)  # the whole 6 s window is in a turn (|desired| > 0.002)
+    self.assertEqual(cols[-1], "assist-limited")  # synthetic driver never presses
+    self.assertAlmostEqual(float(cols[4].rstrip("%")), 60, delta=5)
 
   def test_decoders(self):
     self.assertEqual(ra.decode_motor_torque(bytes([0x02, 0x34, 0x00])), 0x234)

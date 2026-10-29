@@ -18,6 +18,10 @@ value of each at that moment.
 | `steeringTorqueEps` | `carState` | CAN units | **always 0 on Honda**: openpilot's Honda carState never fills it | kept only for non-Honda logs; the report falls back to it when `eps_motor` is absent |
 | `eps_motor` | raw `can`, addr 0x1AB (`STEER_MOTOR_TORQUE`) | EPS units, 0-1023 | the EPS motor torque, 10-bit unsigned magnitude (no sign), 50 Hz | **the key number**: what the EPS actually delivers. Not the same scale as the command (RDX 3G: roughly 1/50 of it) |
 | `steer_status` | raw `can`, addr 0x18F (`STEER_STATUS`) | code 0-7 | EPS status: 0 normal, 1 driver_steering, 2 no_torque_alert_1, 3 low_speed_lockout, 4 no_torque_alert_2, 5 fault_1, 6 tmp_fault, 7 permanent_fault | shows `LOW_SPEED_LOCKOUT` directly, independent of the carState fault flag |
+| `curvature` | `controlsState` | 1/m | curvature the car actually achieved (vehicle model) | what the turn really was |
+| `desiredCurvature` | `controlsState` | 1/m | lag-adjusted curvature the lateral controller is trying to hit | what openpilot wanted |
+| `angle_des_deg`, `angle_err_deg` | `controlsState.lateralControlState.pidState` | deg | PID desired steering angle and error (NaN for non-PID cars) | size of the miss in degrees |
+| `lat_output`, `lat_saturated` | `controlsState.lateralControlState` | normalized, bool | controller output and its saturation flag | the controller asking for everything it can |
 | `steer_ctrl_active` | raw `can`, addr 0x18F | bool | EPS reports it is applying openpilot's torque request | context |
 | `steeringPressed` | `carState` | bool | driver is overriding | excludes driver-caused apparent fades |
 | `steerFaultTemporary` | `carState` | bool | temporary steer fault | on the RDX 3G this also flags `LOW_SPEED_LOCKOUT` above the minimum steer speed (the silent assist-loss fix) |
@@ -83,6 +87,19 @@ request regardless of who holds the wheel; low `steeringPressed` with a high com
 near-zero motor torque is the stronger sign of the motor not following.
 
 The report also lists every `steerFaultTemporary` rising edge with time and speed.
+
+### Lateral tracking
+
+Compares `desiredCurvature` with `curvature` where lateral-active above `--min-speed` and
+`|desired| > --min-curv` (default 0.002 1/m, radius under 500 m). Shortfall is
+`sign(desired) * (desired - achieved) / |desired|`: positive means the car turned less than
+wanted (under-steer), negative means it turned more. Samples with shortfall above
+`--under-frac` (30%) are under-steer; runs of at least `--under-min-s` (1 s) are episodes.
+Each episode gets a heuristic label from how much of it `steeringPressed` was set:
+`assist-limited` (under 25%: the car fell short without the driver pushing), `driver-involved`
+(50% or more), `mixed`. "At ceiling" is the share of the episode with the command at 98% or
+more of `--steer-max`. The fade table also gets an `under-steer` column (mean shortfall in the
+turning part of the fade, `-` if the fade was not in a turn).
 
 ### STEER_STATUS while lateral-active
 
